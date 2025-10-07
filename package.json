@@ -1,0 +1,13 @@
+{
+  "name": "agentkit-chatkit-starter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "devDependencies": {
+    "@vercel/node": "latest",
+    "typescript": "^5.6.3"
+  }
+}
