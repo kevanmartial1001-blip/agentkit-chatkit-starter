@@ -1,56 +1,44 @@
-// api/agent/run.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import OpenAI from 'openai';
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
-const MODEL = process.env.MODEL || 'gpt-5';
+const MODEL = process.env.OPENAI_MODEL || 'gpt-5'; // adjust if needed
 
-if (!OPENAI_API_KEY) {
-  console.warn('OPENAI_API_KEY is not set');
+function json(res: VercelResponse, code: number, payload: unknown) {
+  res.status(code).setHeader('Content-Type', 'application/json');
+  res.send(JSON.stringify(payload));
+}
+function bad(res: VercelResponse, msg: string, code = 400) {
+  return json(res, code, { ok: false, error: msg });
 }
 
-type ToolCall = {
-  id: string;
-  type: 'function';
-  function: { name: string; arguments: string };
-};
-
-type ChatMessage =
-  | { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_call_id?: string }
-  | { role: 'assistant'; content: string; tool_calls?: ToolCall[] };
-
-function baseUrlFromReq(req: VercelRequest) {
-  if (process.env.APP_BASE_URL) return process.env.APP_BASE_URL;
-  const host = (req.headers['x-forwarded-host'] || req.headers['host'] || '').toString();
-  const proto = (req.headers['x-forwarded-proto'] || 'https').toString();
-  return `${proto}://${host}`;
-}
-
-/** OpenAI function schemas (must match names we handle below). */
-const tools = [
+const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
       name: 'research_build_kb',
       description:
-        'Build a company profile and crawl plan for a given website URL. Returns a JSON plan and profile.',
+        'Build a company profile and propose a crawl plan for a website. Returns a profile and prioritized crawl_plan.',
+      strict: true,
       parameters: {
         type: 'object',
         properties: {
-          website: { type: 'string', description: 'Absolute URL, e.g., https://example.com' },
-          tenant_id: {
+          website: {
             type: 'string',
             description:
-              'Optional tenant id to tag artifacts. When missing, backend may generate one.',
+              'Absolute URL for the company (e.g., https://example.com). If user gave a bare domain, still pass it.',
+          },
+          tenant_id: {
+            type: 'string',
+            description: 'Optional tenant id used to tag artifacts/results',
           },
           company_name: {
             type: 'string',
-            description: 'Optional human-friendly company name for profile label.',
+            description: 'Optional human-readable company name',
           },
         },
         required: ['website'],
         additionalProperties: false,
       },
-      strict: true,
     },
   },
   {
@@ -58,171 +46,198 @@ const tools = [
     function: {
       name: 'execute_department',
       description:
-        'Execute one DepartmentTicket by POSTing it to the enterprise backend. Use for SALES, OPS, FIN, etc.',
+        'Execute a department action (SALES, OPS, FIN, etc.). Builds a DepartmentTicket server-side and forwards to /api/dept/all.',
+      strict: true,
       parameters: {
         type: 'object',
         properties: {
-          ticket: {
-            type: 'object',
-            description:
-              'A single DepartmentTicket object with id, dept, action, inputs, context, idempotency_key, sla_sec, retries.',
+          dept: {
+            type: 'string',
+            description: 'Department name',
+            enum: [
+              'SALES',
+              'MARKETING',
+              'ANALYTICS',
+              'EXEC',
+              'PRODUCT',
+              'SECURITY',
+              'FACILITIES',
+              'PROCUREMENT',
+              'LEGAL',
+              'IT',
+              'HR',
+              'FIN',
+              'OPS',
+              'CS',
+              'RESEARCH',
+            ],
           },
+          action: { type: 'string', description: 'Action verb, e.g., create_or_update_lead' },
+          inputs: { type: 'object', description: 'Freeform input payload for the action' },
+          tenant_id: { type: 'string', description: 'Optional tenant id' },
+          id: { type: 'string', description: 'Optional ticket id (server will default if missing)' },
+          idempotency_key: { type: 'string', description: 'Optional idempotency key' },
+          sla_sec: { type: 'integer', description: 'Optional SLA seconds (default ~120)' },
+          retries: { type: 'integer', description: 'Optional retry count (default 2)' },
         },
-        required: ['ticket'],
+        required: ['dept', 'action'],
         additionalProperties: false,
       },
-      strict: true,
     },
   },
-] as const;
+];
 
-/** Minimal wrapper for OpenAI Chat Completions with tools enabled. */
-async function chatWithOpenAI(messages: ChatMessage[]) {
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+// Helper: call your own endpoints
+async function postJSON<T = any>(url: string, body: any): Promise<T> {
+  const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages,
-      tools,
-      tool_choice: 'auto',
-      temperature: 0.2,
-    }),
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
   });
-
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`OpenAI error ${res.status}: ${text}`);
+    const txt = await res.text().catch(() => '');
+    throw new Error(`POST ${url} -> ${res.status}: ${txt}`);
   }
-
-  const data = await res.json();
-  const choice = data.choices?.[0];
-  const msg = choice?.message;
-  return msg as ChatMessage & { tool_calls?: ToolCall[] };
-}
-
-/** Call your existing backend endpoints for each tool. */
-async function handleToolCall(
-  req: VercelRequest,
-  call: ToolCall
-): Promise<{ tool_call_id: string; content: string }> {
-  const baseUrl = baseUrlFromReq(req);
-  const args = JSON.parse(call.function.arguments || '{}');
-
-  switch (call.function.name) {
-    case 'research_build_kb': {
-      const url = `${baseUrl}/api/research/build-kb`;
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          website: args.website,
-          tenant_id: args.tenant_id,
-          company_name: args.company_name,
-        }),
-      });
-      const out = await r.json();
-      return { tool_call_id: call.id, content: JSON.stringify(out) };
-    }
-
-    case 'execute_department': {
-      const url = `${baseUrl}/api/dept/all`;
-      const body = args.ticket && typeof args.ticket === 'object' ? { ticket: args.ticket } : args;
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const out = await r.json();
-      return { tool_call_id: call.id, content: JSON.stringify(out) };
-    }
-
-    default:
-      return {
-        tool_call_id: call.id,
-        content: JSON.stringify({ ok: false, error: `Unknown tool: ${call.function.name}` }),
-      };
-  }
+  return (await res.json()) as T;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
-    return res.status(405).json({ ok: false, error: 'Method not allowed' });
+    return bad(res, 'Method Not Allowed', 405);
   }
 
-  try {
-    const { message, user, context } = (req.body || {}) as {
-      message: string;
-      user?: string;
-      context?: Record<string, unknown>;
-    };
+  const { message, user = 'web_user', context = {} } = (req.body || {}) as {
+    message: string;
+    user?: string;
+    context?: { tenant_id?: string; capabilities?: Record<string, unknown> };
+  };
 
-    if (!message || typeof message !== 'string') {
-      return res.status(400).json({ ok: false, error: 'message is required (string)' });
+  if (!message || typeof message !== 'string') {
+    return bad(res, 'Please provide { "message": "..." }');
+  }
+
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+  const system = [
+    'You are the Master Spine for a digital enterprise.',
+    'Job:',
+    '1) Validate the request and produce/keep a tenant_id.',
+    '2) Plan department steps for execution tasks.',
+    '3) For each step, call execute_department with dept/action/inputs (+ tenant_id if available).',
+    '4) If user mentions a website or asks for research/KB/crawl, call research_build_kb.',
+    '5) Be concise, action-oriented; propose defaults when fields are missing.',
+    'Default order for "create lead + schedule meeting + quote": SALES -> OPS -> FIN.',
+    'Tools: research_build_kb; execute_department (the server will build the full ticket).',
+  ].join('\n');
+
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: system },
+    {
+      role: 'user',
+      content: message,
+    },
+    // Pass tenant context via a hidden assistant message to encourage tool args
+    ...(context?.tenant_id
+      ? [
+          {
+            role: 'system' as const,
+            content: `Tenant context: tenant_id=${context.tenant_id}`,
+          },
+        ]
+      : []),
+  ];
+
+  const toolTrace: any[] = [];
+
+  // tool loop
+  for (let step = 0; step < 8; step++) {
+    const cc = await client.chat.completions.create({
+      model: MODEL,
+      messages,
+      tools: TOOLS,
+      tool_choice: 'auto',
+      temperature: 0.2,
+    });
+
+    const msg = cc.choices[0]?.message;
+    const calls = msg?.tool_calls || [];
+    if (!calls.length) {
+      // done
+      return json(res, 200, {
+        ok: true,
+        final: msg?.content ?? '',
+        tool_trace: toolTrace,
+      });
     }
 
-    // You can keep this system prompt in sync with your Master Spine instructions.
-    const systemPrompt = `
-You are the Master Spine for a digital enterprise.
+    for (const call of calls) {
+      const name = call.function?.name;
+      let args: any = {};
+      try {
+        args = call.function?.arguments ? JSON.parse(call.function.arguments) : {};
+      } catch {
+        // ignore, will surface below
+      }
 
-Your job:
-1) Validate the request and produce/track a tenant_id.
-2) Plan department steps (e.g., SALES → OPS → FIN) for execution tasks.
-3) Use the available tools to execute each step:
-   - research_build_kb(website, tenant_id?, company_name?)
-   - execute_department({ ticket })
-4) For execution, build DepartmentTickets with sensible defaults when fields are missing.
-5) Be concise and action-oriented. Ask only when strictly required.
-6) Policy in tickets: pii=mask, phi=drop, after_hours_outreach=false.
-
-Default execution order for "create lead + schedule meeting + quote":
-SALES → OPS → FIN.
-
-When needed, call tools in any order and as many times as necessary.
-    `.trim();
-
-    const messages: ChatMessage[] = [
-      { role: 'system', content: systemPrompt },
-      ...(user ? [{ role: 'system', content: `user_id=${user}` } as ChatMessage] : []),
-      ...(context ? [{ role: 'system', content: `context=${JSON.stringify(context)}` } as ChatMessage] : []),
-      { role: 'user', content: message },
-    ];
-
-    // Tool-execution loop
-    const MAX_TURNS = 8;
-    let lastAssistant: ChatMessage | null = null;
-
-    for (let i = 0; i < MAX_TURNS; i++) {
-      lastAssistant = await chatWithOpenAI(messages);
-      messages.push(lastAssistant);
-
-      const toolCalls = (lastAssistant as any).tool_calls as ToolCall[] | undefined;
-      if (!toolCalls || toolCalls.length === 0) break;
-
-      // Handle each tool call and append tool results
-      for (const call of toolCalls) {
-        const toolMsg = await handleToolCall(req, call);
+      if (name === 'research_build_kb') {
+        const payload = {
+          website: args.website,
+          tenant_id: args.tenant_id || context?.tenant_id,
+          company_name: args.company_name,
+        };
+        const out = await postJSON(`${req.headers['x-forwarded-proto'] ?? 'https'}://${req.headers.host}/api/research/build-kb`, payload);
+        toolTrace.push({ tool: name, args: payload, result: out });
         messages.push({
           role: 'tool',
-          tool_call_id: toolMsg.tool_call_id,
-          content: toolMsg.content,
+          tool_call_id: call.id!,
+          content: JSON.stringify(out),
+        });
+      } else if (name === 'execute_department') {
+        // Construct a minimal "ticket-ish" body the server can enrich
+        const nowId =
+          args.id ||
+          `sess:${Date.now()}:${args.dept}:${args.action}:0`;
+        const idem =
+          args.idempotency_key ||
+          `${user}:${args.dept}:${args.action}:0`;
+
+        const ticketBody = {
+          id: nowId,
+          dept: args.dept,
+          action: args.action,
+          inputs: args.inputs || {},
+          context: {
+            tenant_id: args.tenant_id || context?.tenant_id || 'tenant_manual_test',
+            capabilities: context?.capabilities || {},
+          },
+          idempotency_key: idem,
+          sla_sec: typeof args.sla_sec === 'number' ? args.sla_sec : 120,
+          retries: typeof args.retries === 'number' ? args.retries : 2,
+        };
+
+        const out = await postJSON(`${req.headers['x-forwarded-proto'] ?? 'https'}://${req.headers.host}/api/dept/all`, {
+          ticket: ticketBody,
+        });
+        toolTrace.push({ tool: name, args: ticketBody, result: out });
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id!,
+          content: JSON.stringify(out),
+        });
+      } else {
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id!,
+          content: JSON.stringify({ ok: false, error: `Unknown tool: ${name}` }),
         });
       }
     }
-
-    const finalText = (lastAssistant?.content ?? '').toString();
-    return res.status(200).json({
-      ok: true,
-      model: MODEL,
-      messages: messages.slice(-10), // return tail for debugging
-      reply: finalText,
-    });
-  } catch (err: any) {
-    console.error(err);
-    return res.status(500).json({ ok: false, error: err?.message || 'Server error' });
   }
+
+  return json(res, 200, {
+    ok: true,
+    final: '(Stopped after tool loop safeguard)',
+    tool_trace: toolTrace,
+  });
 }
