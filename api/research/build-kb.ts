@@ -8,6 +8,21 @@ function bad(res: VercelResponse, msg: string, code = 400) {
   return json(res, code, { ok: false, error: msg });
 }
 
+/** Allow custom-tool string calls like RESEARCH_BUILD_KB({...}) */
+function extractJsonFromParenCall(input: unknown, prefix: string) {
+  try {
+    if (typeof input !== 'string') return { ok: false as const, error: 'not-string' as const };
+    const re = new RegExp(`^\\s*${prefix}\\((([\\s\\S]+))\\)\\s*$`, 'i');
+    const m = input.match(re);
+    if (!m) return { ok: false as const, error: 'no-match' as const };
+    const inner = m[1];
+    const parsed = JSON.parse(inner);
+    return { ok: true as const, json: parsed };
+  } catch (e: any) {
+    return { ok: false as const, error: e?.message || 'parse-error' };
+  }
+}
+
 function ensureAbsoluteUrl(rawIn: unknown) {
   const raw = String(rawIn || '').trim();
   if (!raw) throw new Error('company_url is required (website | company_url | company.url | url)');
@@ -27,7 +42,7 @@ async function fetchTextWithLimit(url: string, ms = 4000, maxBytes = 250_000) {
     const res = await fetch(url, { redirect: 'follow', signal: ctrl.signal });
     if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
     const reader = res.body?.getReader?.();
-    if (!reader) return await res.text(); // environments without streams
+    if (!reader) return await (res as any).text?.() ?? (await res.arrayBuffer()).toString();
     const chunks: Uint8Array[] = [];
     let total = 0;
     while (true) {
@@ -95,8 +110,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return bad(res, 'Method Not Allowed', 405);
   }
 
-  const b: any = req.body || {};
-  const rawUrl = b.website || b.company_url || b?.company?.url || b.url;
+  let b: any | undefined;
+
+  // A) Custom Tool string call: RESEARCH_BUILD_KB({...})
+  if (typeof req.body === 'string') {
+    const ex = extractJsonFromParenCall(req.body, 'RESEARCH_BUILD_KB');
+    if (ex.ok) b = ex.json;
+  }
+
+  // B) Normal JSON body
+  if (!b && typeof req.body === 'object' && req.body) {
+    b = req.body;
+  }
+
+  const rawUrl = b?.website || b?.company_url || b?.company?.url || b?.url;
 
   let absolute: string, host: string;
   try {
@@ -105,8 +132,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return bad(res, e?.message || 'Invalid company URL', 400);
   }
 
-  const tenant_id = b.tenant_id || `tenant_${host.replace(/\./g, '_')}_${Date.now().toString(36)}`;
-  const company_name = b.company_name || b?.company?.name || host;
+  const tenant_id = b?.tenant_id || `tenant_${host.replace(/\./g, '_')}_${Date.now().toString(36)}`;
+  const company_name = b?.company_name || b?.company?.name || host;
 
   // --- SAFE FETCH PLAN (one remote read)
   let discovered: string[] = [];
