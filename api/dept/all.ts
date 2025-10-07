@@ -9,12 +9,9 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
  *   "id": "sess_<ts>:SALES:create_or_update_lead:0",
  *   "dept": "SALES" | "MARKETING" | "ANALYTICS" | "EXEC" | "PRODUCT" | "SECURITY" |
  *           "FACILITIES" | "PROCUREMENT" | "LEGAL" | "IT" | "HR" | "FIN" | "OPS" | "CS" | "RESEARCH",
- *   "action": "string",           // see ACTION_CATALOG for suggestions
- *   "inputs": { ... },            // freeform; validated per dept/action later
- *   "context": {
- *      "tenant_id": "tenant_...",
- *      "capabilities": { ... }    // provider registry (crm, calendar, payments, etc.)
- *   },
+ *   "action": "string",
+ *   "inputs": { ... },
+ *   "context": { "tenant_id": "tenant_...", "capabilities": { ... } },
  *   "idempotency_key": "sess:dept:action:0",
  *   "sla_sec": 120,
  *   "retries": 2
@@ -61,8 +58,22 @@ function bad(res: VercelResponse, msg: string, code = 400) {
   return json(res, code, { ok: false, error: msg });
 }
 
+/** Allow custom-tool string calls like EXECUTE_DEPARTMENT({...}) */
+function extractJsonFromParenCall(input: unknown, prefix: string) {
+  try {
+    if (typeof input !== 'string') return { ok: false as const, error: 'not-string' as const };
+    const re = new RegExp(`^\\s*${prefix}\\((([\\s\\S]+))\\)\\s*$`, 'i');
+    const m = input.match(re);
+    if (!m) return { ok: false as const, error: 'no-match' as const };
+    const inner = m[1];
+    const parsed = JSON.parse(inner);
+    return { ok: true as const, json: parsed };
+  } catch (e: any) {
+    return { ok: false as const, error: e?.message || 'parse-error' };
+  }
+}
+
 // --- ACTION CATALOG -----------------------------------------------------------
-// (Used for docs + sensible defaults. You can enforce/validate later per adapter.)
 const ACTION_CATALOG: Record<Dept, string[]> = {
   SALES:       ['create_or_update_lead', 'qualify_lead', 'create_opportunity', 'update_pipeline_stage', 'log_activity'],
   MARKETING:   ['create_campaign', 'send_newsletter', 'segment_audience', 'sync_ad_platform', 'publish_post'],
@@ -82,7 +93,6 @@ const ACTION_CATALOG: Record<Dept, string[]> = {
 };
 
 // --- PROVIDER REGISTRY (MOCK) ------------------------------------------------
-// Later: switch to real providers using env vars (e.g., HUBSPOT, GOOGLE_CALENDAR).
 function providerFor(dept: Dept) {
   switch (dept) {
     case 'SALES': return { adapter: 'mock', provider: 'crm:none' };
@@ -112,7 +122,6 @@ function normalizeInputs(ticket: DeptTicket) {
   const t = { ...ticket };
   t.inputs = t.inputs || {};
 
-  // tiny defaults for common actions
   if (t.dept === 'SALES' && t.action === 'create_or_update_lead') {
     t.inputs = { lead_name: 'Unknown Lead', source: 'agent', ...t.inputs };
   }
@@ -133,49 +142,34 @@ async function handleDept(ticket: DeptTicket): Promise<DeptResult> {
   switch (t.dept) {
     case 'SALES':
       return ok(t, `SALES processed: ${a} (lead=${(t.inputs as any).lead_name})`);
-
     case 'MARKETING':
       return ok(t, `MARKETING processed: ${a} (campaign=${(t.inputs as any).campaign || 'n/a'})`);
-
     case 'ANALYTICS':
       return ok(t, `ANALYTICS processed: ${a} (report=${(t.inputs as any).report || 'n/a'})`);
-
     case 'EXEC':
       return ok(t, `EXEC processed: ${a} (digest prepared)`);
-
     case 'PRODUCT':
       return ok(t, `PRODUCT processed: ${a} (ticket/spec created)`);
-
     case 'SECURITY':
       return ok(t, `SECURITY processed: ${a} (risk/incident logged)`);
-
     case 'FACILITIES':
       return ok(t, `FACILITIES processed: ${a} (work order queued)`);
-
     case 'PROCUREMENT':
       return ok(t, `PROCUREMENT processed: ${a} (vendor=${(t.inputs as any).vendor || 'n/a'})`);
-
     case 'LEGAL':
       return ok(t, `LEGAL processed: ${a} (doc=${(t.inputs as any).doc_type || 'n/a'})`);
-
     case 'IT':
       return ok(t, `IT processed: ${a} (request=${(t.inputs as any).request || 'n/a'})`);
-
     case 'HR':
       return ok(t, `HR processed: ${a} (employee=${(t.inputs as any).employee || 'n/a'})`);
-
     case 'FIN':
       return ok(t, `FIN processed: ${a} (terms=${(t.inputs as any).terms || 'NET 30'})`);
-
     case 'OPS':
       return ok(t, `OPS processed: ${a} (${(t.inputs as any).length_min || 30} minutes)`);
-
     case 'CS':
       return ok(t, `CS processed: ${a} (ticket created)`);
-
     case 'RESEARCH':
       return ok(t, `RESEARCH processed: ${a} (see /api/research/build-kb for heavy work)`, 'Use the dedicated KB endpoint for crawling.');
-
     default:
       return {
         ok: false,
@@ -195,8 +189,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return bad(res, 'Method Not Allowed', 405);
   }
 
-  const body = req.body as any;
-  const ticket: DeptTicket = body?.ticket ?? body;
+  let ticket: DeptTicket | undefined;
+
+  // A) Custom Tool string call: EXECUTE_DEPARTMENT({...})
+  if (typeof req.body === 'string') {
+    const ex = extractJsonFromParenCall(req.body, 'EXECUTE_DEPARTMENT');
+    if (ex.ok) ticket = ex.json as DeptTicket;
+  }
+
+  // B) Normal JSON body (supports {ticket:{...}} or direct object)
+  if (!ticket && typeof req.body === 'object' && req.body) {
+    ticket = (req.body as any).ticket ?? (req.body as any);
+  }
 
   if (!ticket || !ticket.dept || !ticket.action || !ticket.context?.tenant_id) {
     return bad(res, 'BAD_REQUEST: ticket.dept, ticket.action, and context.tenant_id are required', 400);
