@@ -4,44 +4,51 @@
     <meta charset="utf-8" />
     <title>AgentKit + ChatKit</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <!-- Loads the ChatKit web component. -->
     <script type="module">
-      import { ChatKit } from "https://esm.run/@openai/chatkit"; // web component bundle
-      // nothing to export — custom element is registered as <openai-chatkit>
+      import { ChatKit } from "https://esm.run/@openai/chatkit";
+      window.ChatKit = ChatKit;
     </script>
     <style>
       html, body { height: 100%; margin: 0; background:#0b0f14; }
       #wrap { height: 100%; display:grid; place-items:center; padding: 16px; }
-      openai-chatkit { width: 380px; height: 640px; border-radius:16px; overflow:hidden; }
-      @media (min-width: 900px) { openai-chatkit { width: 420px; height: 720px; } }
+      openai-chatkit { width: 420px; height: 720px; border-radius:16px; overflow:hidden; }
     </style>
   </head>
   <body>
     <div id="wrap">
-      <openai-chatkit id="ck" class="h-[640px] w-[380px]"></openai-chatkit>
+      <openai-chatkit id="ck"></openai-chatkit>
     </div>
-
     <script type="module">
       const ck = document.getElementById('ck');
-
-      // Configure how the widget fetches/refreshes its client token.
       ck.setOptions({
         api: {
           async getClientSecret(currentClientSecret) {
-            if (!currentClientSecret) {
-              const r = await fetch('/api/chatkit/start', { method: 'POST' });
-              const { client_secret } = await r.json();
-              return client_secret;
+            try {
+              if (!currentClientSecret) {
+                const r = await fetch('/api/chatkit/start', { method: 'POST' });
+                const j = await r.json();
+                console.log('[ChatKit] start ->', j);
+                if (!j?.client_secret) throw new Error('No client_secret from /api/chatkit/start');
+                return j.client_secret;
+              }
+              const r = await fetch('/api/chatkit/refresh', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ currentClientSecret }),
+              });
+              const j = await r.json();
+              console.log('[ChatKit] refresh ->', j);
+              if (!j?.client_secret) throw new Error('No client_secret from /api/chatkit/refresh');
+              return j.client_secret;
+            } catch (e) {
+              console.error('[ChatKit] token error', e);
+              throw e;
             }
-            const r = await fetch('/api/chatkit/refresh', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ currentClientSecret }),
-            });
-            const { client_secret } = await r.json();
-            return client_secret;
           },
         },
+      });
+      ck.addEventListener('error', (e) => {
+        console.error('[ChatKit] widget error', e.detail || e);
       });
     </script>
   </body>
