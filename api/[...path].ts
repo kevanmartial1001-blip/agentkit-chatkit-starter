@@ -9,8 +9,15 @@ function bad(res: VercelResponse, msg: string, code = 400) {
   return json(res, code, { ok: false, error: msg });
 }
 
+// Normalize the dynamic catch-all param so it always becomes string[]
+function partsFrom(q: unknown): string[] {
+  if (Array.isArray(q)) return q as string[];
+  if (typeof q === 'string' && q.length) return [q];
+  return [];
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const path = (req.query.path || []) as string[];
+  const path = partsFrom((req.query as any).path);
   const method = req.method || 'GET';
 
   // --- GET /api/health
@@ -73,6 +80,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return json(res, 200, { ok: true, stage: 'FINAL', summary, results });
   }
 
-  // --- Fallback
+  // --- Fallback (echo route for debugging)
   return json(res, 404, { ok: false, error: 'Not Found', route: `/api/${path.join('/')}` });
 }
