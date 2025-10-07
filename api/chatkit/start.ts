@@ -2,12 +2,12 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 /**
  * Issue a short-lived ChatKit client secret for your published workflow.
- * Accepts POST (recommended). GET is also allowed for quick manual testing.
+ * Accepts POST (recommended). GET is also allowed for manual testing.
  *
- * Env needed:
+ * Env:
  * - OPENAI_API_KEY
- * - CHATKIT_WORKFLOW_ID          (e.g. "wf_68e5...")
- * - (optional) CHATKIT_WORKFLOW_VERSION  e.g. "2"
+ * - CHATKIT_WORKFLOW_ID                 e.g. "wf_68e5..."
+ * - (optional) CHATKIT_WORKFLOW_VERSION e.g. "2"
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
@@ -21,9 +21,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     const version = process.env.CHATKIT_WORKFLOW_VERSION; // optional
 
-    // NEW: ChatKit expects { workflow: { id, version? } }
+    // Accept optional user fields from query/body; otherwise autogenerate.
+    const parsedBody =
+      typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
+    const userFromQuery =
+      typeof req.query.userId === "string" || typeof req.query.userName === "string"
+        ? { id: String(req.query.userId || ""), name: String(req.query.userName || "") }
+        : undefined;
+
+    const user: { id: string; name?: string } = {
+      id:
+        (parsedBody.userId as string) ||
+        (userFromQuery?.id as string) ||
+        `user_${Date.now().toString(36)}`,
+      name:
+        (parsedBody.userName as string) ||
+        (userFromQuery?.name as string) ||
+        undefined,
+    };
+
+    // ChatKit expects { workflow: { id, version? }, user: { id, name? } }
     const body = {
       workflow: version ? { id: workflowId, version } : { id: workflowId },
+      user,
     };
 
     const resp = await fetch("https://api.openai.com/v1/chatkit/sessions", {
