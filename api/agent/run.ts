@@ -1,243 +1,191 @@
+// /api/agent/run.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import OpenAI from 'openai';
 
-const MODEL = process.env.OPENAI_MODEL || 'gpt-5'; // adjust if needed
+type AgentPayload = {
+  message: string;
+  user?: string;
+  context?: {
+    tenant_id?: string;
+    capabilities?: Record<string, unknown>;
+  };
+};
 
-function json(res: VercelResponse, code: number, payload: unknown) {
-  res.status(code).setHeader('Content-Type', 'application/json');
-  res.send(JSON.stringify(payload));
+// Small helpers
+function ok(res: VercelResponse, payload: unknown, status = 200) {
+  res.status(status).setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(payload));
 }
-function bad(res: VercelResponse, msg: string, code = 400) {
-  return json(res, code, { ok: false, error: msg });
+function fail(res: VercelResponse, msg: string, status = 400, extra: any = {}) {
+  res.status(status).setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify({ ok: false, error: msg, ...extra }));
 }
 
-const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
-  {
-    type: 'function',
-    function: {
-      name: 'research_build_kb',
-      description:
-        'Build a company profile and propose a crawl plan for a website. Returns a profile and prioritized crawl_plan.',
-      strict: true,
-      parameters: {
-        type: 'object',
-        properties: {
-          website: {
-            type: 'string',
-            description:
-              'Absolute URL for the company (e.g., https://example.com). If user gave a bare domain, still pass it.',
-          },
-          tenant_id: {
-            type: 'string',
-            description: 'Optional tenant id used to tag artifacts/results',
-          },
-          company_name: {
-            type: 'string',
-            description: 'Optional human-readable company name',
-          },
-        },
-        required: ['website'],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'execute_department',
-      description:
-        'Execute a department action (SALES, OPS, FIN, etc.). Builds a DepartmentTicket server-side and forwards to /api/dept/all.',
-      strict: true,
-      parameters: {
-        type: 'object',
-        properties: {
-          dept: {
-            type: 'string',
-            description: 'Department name',
-            enum: [
-              'SALES',
-              'MARKETING',
-              'ANALYTICS',
-              'EXEC',
-              'PRODUCT',
-              'SECURITY',
-              'FACILITIES',
-              'PROCUREMENT',
-              'LEGAL',
-              'IT',
-              'HR',
-              'FIN',
-              'OPS',
-              'CS',
-              'RESEARCH',
-            ],
-          },
-          action: { type: 'string', description: 'Action verb, e.g., create_or_update_lead' },
-          inputs: { type: 'object', description: 'Freeform input payload for the action' },
-          tenant_id: { type: 'string', description: 'Optional tenant id' },
-          id: { type: 'string', description: 'Optional ticket id (server will default if missing)' },
-          idempotency_key: { type: 'string', description: 'Optional idempotency key' },
-          sla_sec: { type: 'integer', description: 'Optional SLA seconds (default ~120)' },
-          retries: { type: 'integer', description: 'Optional retry count (default 2)' },
-        },
-        required: ['dept', 'action'],
-        additionalProperties: false,
-      },
-    },
-  },
-];
+const THIS_ORIGIN = process.env.VERCEL_URL
+  ? `https://${process.env.VERCEL_URL}`
+  : ''; // optional; we’ll build absolute URLs from req.headers if needed
 
-// Helper: call your own endpoints
-async function postJSON<T = any>(url: string, body: any): Promise<T> {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    throw new Error(`POST ${url} -> ${res.status}: ${txt}`);
+function absoluteApi(req: VercelRequest, path: string) {
+  if (THIS_ORIGIN) return `${THIS_ORIGIN}${path}`;
+  // Build from incoming request host if running locally or preview
+  const proto = (req.headers['x-forwarded-proto'] as string) || 'https';
+  const host = (req.headers['x-forwarded-host'] as string) || req.headers.host;
+  return `${proto}://${host}${path}`;
+}
+
+function extractFirstUrl(text: string): string | null {
+  const m = text.match(/\bhttps?:\/\/[^\s)]+/i);
+  return m ? m[0] : null;
+}
+
+function wantsResearch(text: string) {
+  const s = text.toLowerCase();
+  return s.includes('research') || /\bhttps?:\/\//i.test(s);
+}
+
+function wantsLead(text: string) {
+  return /create (a )?new lead|create lead|add lead/i.test(text);
+}
+function wantsMeeting(text: string) {
+  return /schedule .*meeting|book .*meeting|30 minute meeting|30-minute meeting/i.test(text);
+}
+function wantsQuote(text: string) {
+  return /draft (a )?quote|create quote|make a quote/i.test(text);
+}
+
+async function postJson(url: string, body: any, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    const txt = await res.text();
+    let json: any = null;
+    try { json = txt ? JSON.parse(txt) : null; } catch { /* ignore */ }
+    return { status: res.status, ok: res.ok, json, text: txt };
+  } finally {
+    clearTimeout(t);
   }
-  return (await res.json()) as T;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
-    return bad(res, 'Method Not Allowed', 405);
+    return fail(res, 'Method not allowed', 405);
   }
 
-  const { message, user = 'web_user', context = {} } = (req.body || {}) as {
-    message: string;
-    user?: string;
-    context?: { tenant_id?: string; capabilities?: Record<string, unknown> };
-  };
+  try {
+    const body = (req.body || {}) as AgentPayload;
+    const message = (body.message || '').trim();
+    if (!message) return fail(res, "Missing 'message' in body.", 400);
 
-  if (!message || typeof message !== 'string') {
-    return bad(res, 'Please provide { "message": "..." }');
-  }
+    const tenant_id =
+      body.context?.tenant_id ||
+      'tenant_manual_test'; // sensible default so you don’t have to type it every time
 
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const capabilities = body.context?.capabilities || {};
 
-  const system = [
-    'You are the Master Spine for a digital enterprise.',
-    'Job:',
-    '1) Validate the request and produce/keep a tenant_id.',
-    '2) Plan department steps for execution tasks.',
-    '3) For each step, call execute_department with dept/action/inputs (+ tenant_id if available).',
-    '4) If user mentions a website or asks for research/KB/crawl, call research_build_kb.',
-    '5) Be concise, action-oriented; propose defaults when fields are missing.',
-    'Default order for "create lead + schedule meeting + quote": SALES -> OPS -> FIN.',
-    'Tools: research_build_kb; execute_department (the server will build the full ticket).',
-  ].join('\n');
+    const plan: Array<{ step: string; endpoint: string; request: any; response?: any }> = [];
+    const results: any = { research: null, sales: null, ops: null, fin: null };
 
-  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    { role: 'system', content: system },
-    {
-      role: 'user',
-      content: message,
-    },
-    // Pass tenant context via a hidden assistant message to encourage tool args
-    ...(context?.tenant_id
-      ? [
-          {
-            role: 'system' as const,
-            content: `Tenant context: tenant_id=${context.tenant_id}`,
-          },
-        ]
-      : []),
-  ];
+    // 1) Research branch (KB)
+    if (wantsResearch(message)) {
+      const website = extractFirstUrl(message) || 'https://example.com';
+      const kbReq = {
+        website,
+        tenant_id,
+        company_name: new URL(website).hostname.replace(/^www\./i, ''),
+      };
+      const kbUrl = absoluteApi(req, '/api/research/build-kb');
+      const kbResp = await postJson(kbUrl, kbReq);
 
-  const toolTrace: any[] = [];
+      plan.push({ step: 'research_build_kb', endpoint: kbUrl, request: kbReq, response: kbResp });
 
-  // tool loop
-  for (let step = 0; step < 8; step++) {
-    const cc = await client.chat.completions.create({
-      model: MODEL,
-      messages,
-      tools: TOOLS,
-      tool_choice: 'auto',
-      temperature: 0.2,
-    });
-
-    const msg = cc.choices[0]?.message;
-    const calls = msg?.tool_calls || [];
-    if (!calls.length) {
-      // done
-      return json(res, 200, {
-        ok: true,
-        final: msg?.content ?? '',
-        tool_trace: toolTrace,
-      });
-    }
-
-    for (const call of calls) {
-      const name = call.function?.name;
-      let args: any = {};
-      try {
-        args = call.function?.arguments ? JSON.parse(call.function.arguments) : {};
-      } catch {
-        // ignore, will surface below
-      }
-
-      if (name === 'research_build_kb') {
-        const payload = {
-          website: args.website,
-          tenant_id: args.tenant_id || context?.tenant_id,
-          company_name: args.company_name,
-        };
-        const out = await postJSON(`${req.headers['x-forwarded-proto'] ?? 'https'}://${req.headers.host}/api/research/build-kb`, payload);
-        toolTrace.push({ tool: name, args: payload, result: out });
-        messages.push({
-          role: 'tool',
-          tool_call_id: call.id!,
-          content: JSON.stringify(out),
-        });
-      } else if (name === 'execute_department') {
-        // Construct a minimal "ticket-ish" body the server can enrich
-        const nowId =
-          args.id ||
-          `sess:${Date.now()}:${args.dept}:${args.action}:0`;
-        const idem =
-          args.idempotency_key ||
-          `${user}:${args.dept}:${args.action}:0`;
-
-        const ticketBody = {
-          id: nowId,
-          dept: args.dept,
-          action: args.action,
-          inputs: args.inputs || {},
-          context: {
-            tenant_id: args.tenant_id || context?.tenant_id || 'tenant_manual_test',
-            capabilities: context?.capabilities || {},
-          },
-          idempotency_key: idem,
-          sla_sec: typeof args.sla_sec === 'number' ? args.sla_sec : 120,
-          retries: typeof args.retries === 'number' ? args.retries : 2,
-        };
-
-        const out = await postJSON(`${req.headers['x-forwarded-proto'] ?? 'https'}://${req.headers.host}/api/dept/all`, {
-          ticket: ticketBody,
-        });
-        toolTrace.push({ tool: name, args: ticketBody, result: out });
-        messages.push({
-          role: 'tool',
-          tool_call_id: call.id!,
-          content: JSON.stringify(out),
-        });
+      if (!kbResp.ok) {
+        // Continue but record the failure
+        results.research = { ok: false, status: kbResp.status, body: kbResp.json || kbResp.text };
       } else {
-        messages.push({
-          role: 'tool',
-          tool_call_id: call.id!,
-          content: JSON.stringify({ ok: false, error: `Unknown tool: ${name}` }),
-        });
+        results.research = kbResp.json;
       }
     }
-  }
 
-  return json(res, 200, {
-    ok: true,
-    final: '(Stopped after tool loop safeguard)',
-    tool_trace: toolTrace,
-  });
+    // 2) Execution branch (tickets)
+    const needsLead = wantsLead(message);
+    const needsMeeting = wantsMeeting(message);
+    const needsQuote = wantsQuote(message);
+
+    const deptUrl = absoluteApi(req, '/api/dept/all');
+
+    // SALES: create_or_update_lead
+    if (needsLead) {
+      const ticket = {
+        id: 'sess_test:SALES:create_or_update_lead:0',
+        dept: 'SALES',
+        action: 'create_or_update_lead',
+        inputs: { lead_name: 'Unknown Lead', source: 'agent' },
+        context: { tenant_id, capabilities },
+        idempotency_key: 'sess_test:SALES:create_or_update_lead:0',
+        sla_sec: 120,
+        retries: 2,
+      };
+      const resp = await postJson(deptUrl, { ticket });
+      plan.push({ step: 'execute_department:SALES', endpoint: deptUrl, request: { ticket }, response: resp });
+      results.sales = resp.json || resp.text;
+    }
+
+    // OPS: schedule_meeting (default 30 min)
+    if (needsMeeting) {
+      const ticket = {
+        id: 'sess_test:OPS:schedule_meeting:0',
+        dept: 'OPS',
+        action: 'schedule_meeting',
+        inputs: { length_min: 30, calendar: 'owner' },
+        context: { tenant_id, capabilities },
+        idempotency_key: 'sess_test:OPS:schedule_meeting:0',
+        sla_sec: 120,
+        retries: 2,
+      };
+      const resp = await postJson(deptUrl, { ticket });
+      plan.push({ step: 'execute_department:OPS', endpoint: deptUrl, request: { ticket }, response: resp });
+      results.ops = resp.json || resp.text;
+    }
+
+    // FIN: draft_quote
+    if (needsQuote) {
+      const ticket = {
+        id: 'sess_test:FIN:draft_quote:0',
+        dept: 'FIN',
+        action: 'draft_quote',
+        inputs: { currency: 'USD', terms: 'NET 30' },
+        context: { tenant_id, capabilities },
+        idempotency_key: 'sess_test:FIN:draft_quote:0',
+        sla_sec: 120,
+        retries: 2,
+      };
+      const resp = await postJson(deptUrl, { ticket });
+      plan.push({ step: 'execute_department:FIN', endpoint: deptUrl, request: { ticket }, response: resp });
+      results.fin = resp.json || resp.text;
+    }
+
+    // Final reply
+    return ok(res, {
+      ok: true,
+      user: body.user || 'anonymous',
+      context: { tenant_id },
+      summary: {
+        did_research: Boolean(results.research),
+        did_sales: Boolean(results.sales),
+        did_ops: Boolean(results.ops),
+        did_fin: Boolean(results.fin),
+      },
+      results,
+      debug_plan: plan, // helpful to view in Vercel logs or browser
+    });
+  } catch (err: any) {
+    console.error('agent/run error:', err?.stack || err);
+    return fail(res, 'Unhandled error in /api/agent/run', 500, { details: String(err?.message || err) });
+  }
 }
