@@ -72,7 +72,7 @@
 
     try{
       // call your chat endpoint (which calls corp/ingest)
-      const res = await fetch('/api/chat', {
+      const res = await fetch('/api/agent/chat', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
