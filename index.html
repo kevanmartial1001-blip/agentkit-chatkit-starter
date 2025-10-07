@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AgentKit Starter — Live Test</title>
+  <style>
+    :root{--bg:#0b0c10;--card:#141824;--ink:#e9edf1;--muted:#9aa6b2;--accent:#5eead4;--line:#232735}
+    *{box-sizing:border-box} html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Inter,Roboto,Arial,sans-serif}
+    .wrap{max-width:980px;margin:24px auto;padding:0 16px}
+    h1{font-size:22px;margin:0 0 12px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin:12px 0}
+    label{display:block;color:var(--muted);font-size:13px;margin-bottom:6px}
+    input,textarea,button{width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);background:#0f1320;color:var(--ink)}
+    textarea{min-height:80px;resize:vertical}
+    button{background:var(--accent);color:#0b0c10;border:none;font-weight:600;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    pre{white-space:pre-wrap;background:#0f1320;border:1px solid var(--line);padding:12px;border-radius:10px;max-height:420px;overflow:auto}
+    .muted{color:var(--muted);font-size:12px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>AgentKit Starter — Live Test</h1>
+    <div class="muted">Domain: <span id="origin"></span></div>
+
+    <div class="card">
+      <h2 style="margin-top:0">1) Master Spine — /api/corp/ingest</h2>
+      <label>Utterance</label>
+      <textarea id="utterance">Create a new lead in the CRM, schedule a 30 minute meeting, and draft a quote.</textarea>
+      <div class="row">
+        <div>
+          <label>Company Name</label>
+          <input id="companyName" value="Acme" />
+        </div>
+        <div>
+          <label>Company Domain</label>
+          <input id="companyDomain" value="acme.com" />
+        </div>
+      </div>
+      <button id="btnIngest">Send to /api/corp/ingest</button>
+      <pre id="outIngest">{}</pre>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">2) Research — /api/research/build-kb</h2>
+      <label>Company Website (url)</label>
+      <input id="companyUrl" value="https://example.com" />
+      <button id="btnKB">Build KB (stub + light fetch)</button>
+      <pre id="outKB">{}</pre>
+    </div>
+  </div>
+
+  <script>
+    const $ = sel => document.querySelector(sel);
+    $('#origin').textContent = location.origin;
+
+    async function post(path, body) {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      const txt = await res.text();
+      try { return JSON.parse(txt); } catch { return { raw: txt } }
+    }
+
+    $('#btnIngest').onclick = async () => {
+      const btn = $('#btnIngest'); btn.disabled = true; btn.textContent = 'Running...';
+      const data = await post('/api/corp/ingest', {
+        user_id: 'visitor-web',
+        session_id: 'sess_web_' + Date.now(),
+        utterance: $('#utterance').value,
+        channels: ['chat','email'],
+        context: { company: { name: $('#companyName').value, domain: $('#companyDomain').value, hq_country: 'US' } },
+        constraints: { sensitivity: 'NONE' }
+      });
+      $('#outIngest').textContent = JSON.stringify(data, null, 2);
+      btn.disabled = false; btn.textContent = 'Send to /api/corp/ingest';
+    };
+
+    $('#btnKB').onclick = async () => {
+      const btn = $('#btnKB'); btn.disabled = true; btn.textContent = 'Running...';
+      const data = await post('/api/research/build-kb', {
+        tenant_id: 'tenant_web_' + Date.now().toString(36),
+        company_name: $('#companyUrl').value.replace(/^https?:\/\/(www\.)?/,'').split('/')[0],
+        website: $('#companyUrl').value
+      });
+      $('#outKB').textContent = JSON.stringify(data, null, 2);
+      btn.disabled = false; btn.textContent = 'Build KB (stub + light fetch)';
+    };
+  </script>
+</body>
+</html>
