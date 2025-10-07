@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AgentKit Starter — Chat</title>
+  <style>
+    :root{--bg:#0b0c10;--card:#141824;--ink:#e9edf1;--muted:#9aa6b2;--accent:#5eead4;--line:#232735}
+    *{box-sizing:border-box} html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Inter,Roboto,Arial,sans-serif}
+    .wrap{max-width:900px;margin:24px auto;padding:0 16px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px}
+    .msg{padding:10px 12px;border-radius:12px;margin:8px 0;max-width:75%}
+    .u{background:#0f1320;margin-left:auto}
+    .a{background:#0e1b15;border:1px solid #0f2a24}
+    .row{display:grid;grid-template-columns:1fr auto;gap:10px;margin-top:10px}
+    input,button{padding:12px;border-radius:10px;border:1px solid var(--line);background:#0f1320;color:var(--ink)}
+    button{background:var(--accent);color:#0b0c10;border:none;font-weight:600;cursor:pointer}
+    button:disabled{opacity:.6}
+    .muted{color:var(--muted);font-size:12px}
+    pre{white-space:pre-wrap;background:#0f1320;border:1px solid var(--line);padding:12px;border-radius:10px;max-height:240px;overflow:auto}
+    details{margin-top:8px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>AgentKit Starter — Chat</h1>
+    <div class="muted">This calls <code>/api/chat</code> → which calls <code>/api/corp/ingest</code>.</div>
+    <div class="card">
+      <div id="log"></div>
+      <div class="row">
+        <input id="msg" placeholder="Ask: Create a lead, schedule a meeting, and draft a quote…" />
+        <button id="send">Send</button>
+      </div>
+      <details>
+        <summary class="muted">Show last raw JSON</summary>
+        <pre id="raw">{}</pre>
+      </details>
+    </div>
+  </div>
+  <script>
+    const $ = s => document.querySelector(s);
+    const log = $('#log');
+    function add(role, text){
+      const div = document.createElement('div');
+      div.className = 'msg ' + (role === 'user' ? 'u' : 'a');
+      div.textContent = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+    async function send(){
+      const input = $('#msg');
+      const btn = $('#send');
+      const text = input.value.trim();
+      if(!text) return;
+      add('user', text);
+      input.value = '';
+      btn.disabled = true;
+      try{
+        const res = await fetch('/api/chat', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({
+            message: text,
+            context: { company: { name:'Acme', domain:'acme.com', hq_country:'US' } }
+          })
+        });
+        const data = await res.json();
+        add('assistant', data?.reply || 'No reply');
+        $('#raw').textContent = JSON.stringify(data, null, 2);
+      }catch(e){
+        add('assistant', 'Error: ' + e);
+      }finally{
+        btn.disabled = false;
+      }
+    }
+    $('#send').onclick = send;
+    $('#msg').addEventListener('keydown', (e)=>{ if(e.key==='Enter') send(); });
+  </script>
+</body>
+</html>
