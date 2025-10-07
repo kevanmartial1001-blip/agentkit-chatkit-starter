@@ -1,41 +1,52 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 /**
- * Creates a ChatKit session for the published Agent Builder workflow
- * and returns a short-lived client secret for the browser.
+ * Issue a short-lived ChatKit client secret for your published workflow.
+ * Accepts POST (recommended). GET is also allowed for quick manual testing.
  *
- * NOTE: The exact REST path for session creation comes from the ChatKit docs.
- * If your SDK exposes it, swap the fetch() below with the official client call.
+ * Env needed:
+ * - OPENAI_API_KEY
+ * - CHATKIT_WORKFLOW_ID
+ * - (optional) CHATKIT_WORKFLOW_VERSION  e.g. "2"
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+    if (req.method !== "POST" && req.method !== "GET") {
+      return res.status(405).json({ error: "Method not allowed" });
+    }
 
-    const workflow_id = process.env.CHATKIT_WORKFLOW_ID!;
-    const version = process.env.CHATKIT_WORKFLOW_VERSION || undefined;
+    const workflow_id = process.env.CHATKIT_WORKFLOW_ID;
+    if (!workflow_id) {
+      return res.status(500).json({ error: "CHATKIT_WORKFLOW_ID is not set" });
+    }
+    const version = process.env.CHATKIT_WORKFLOW_VERSION; // optional
 
-    // Create a ChatKit session with your workflow ID
-    // See: “Authentication → Generate tokens on your server”
-    // https://openai.github.io/chatkit-js/guides/authentication
-    const resp = await fetch('https://api.openai.com/v1/chatkit/sessions', {
-      method: 'POST',
+    const body: Record<string, unknown> = { workflow_id };
+    if (version) body.version = version;
+
+    const resp = await fetch("https://api.openai.com/v1/chatkit/sessions", {
+      method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
+        "Content-Type": "application/json",
+        // REQUIRED header for ChatKit beta endpoints:
+        "OpenAI-Beta": "chatkit_beta=v1",
       },
-      body: JSON.stringify(
-        version ? { workflow_id, version } : { workflow_id }
-      ),
+      body: JSON.stringify(body),
     });
 
     if (!resp.ok) {
       const text = await resp.text();
-      return res.status(resp.status).json({ error: `session create failed`, detail: text });
+      return res
+        .status(resp.status)
+        .json({ error: "session create failed", detail: text });
     }
 
     const data = await resp.json(); // { client_secret, expires_at, ... }
     return res.status(200).json({ client_secret: data.client_secret });
   } catch (err: any) {
-    return res.status(500).json({ error: 'unhandled', detail: err?.message || String(err) });
+    return res
+      .status(500)
+      .json({ error: "unhandled", detail: err?.message || String(err) });
   }
 }
