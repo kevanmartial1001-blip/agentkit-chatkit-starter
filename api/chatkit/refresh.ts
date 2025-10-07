@@ -1,10 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-/**
- * Refresh an expiring ChatKit client secret.
- * Accepts POST with JSON body { currentClientSecret }.
- * GET is also allowed for quick manual testing: /api/chatkit/refresh?currentClientSecret=...
- */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     if (req.method !== "POST" && req.method !== "GET") {
@@ -23,19 +18,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: "currentClientSecret is required" });
     }
 
-    const resp = await fetch(
-      "https://api.openai.com/v1/chatkit/sessions/refresh",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-          // REQUIRED header for ChatKit beta endpoints:
-          "OpenAI-Beta": "chatkit_beta=v1",
-        },
-        body: JSON.stringify({ client_secret: currentClientSecret }),
-      }
-    );
+    const resp = await fetch("https://api.openai.com/v1/chatkit/sessions/refresh", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+        "OpenAI-Beta": "chatkit_beta=v1",
+      },
+      body: JSON.stringify({ client_secret: currentClientSecret }),
+    });
 
     if (!resp.ok) {
       const text = await resp.text();
@@ -44,7 +35,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .json({ error: "session refresh failed", detail: text });
     }
 
-    const data = await resp.json(); // { client_secret, expires_at, ... }
+    const data = await resp.json();
     return res.status(200).json({ client_secret: data.client_secret });
   } catch (err: any) {
     return res
