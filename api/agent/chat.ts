@@ -1,9 +1,14 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import OpenAI from 'openai';
 
+// Toggle spending: "openai" uses the API; anything else stays local + free
 const MODE = (process.env.AGENT_MODE || 'local').toLowerCase();
 
-type Dept = 'SALES' | 'OPS' | 'FIN';
+// ==== Types ==================================================================
+type Dept =
+  | 'SALES' | 'MARKETING' | 'ANALYTICS' | 'EXEC' | 'PRODUCT' | 'SECURITY'
+  | 'FACILITIES' | 'PROCUREMENT' | 'LEGAL' | 'IT' | 'HR' | 'FIN' | 'OPS' | 'CS' | 'RESEARCH';
+
 type DeptTicket = {
   id: string;
   dept: Dept;
@@ -15,6 +20,7 @@ type DeptTicket = {
   retries: number;
 };
 
+// ==== Helpers ================================================================
 function mkCapabilities() {
   return {
     crm: { provider: 'none' },
@@ -30,15 +36,44 @@ function mkCapabilities() {
 // Build a safe ticket if the model forgets to pass one
 function synthTicket(funcName: string, args: any): DeptTicket {
   const caps = mkCapabilities();
+  // Guess dept from function name or args
   const dept: Dept =
     (args?.ticket?.dept ||
       args?.dept ||
-      (funcName.startsWith('sales') ? 'SALES' : funcName.startsWith('ops') ? 'OPS' : 'FIN')) as Dept;
+      (funcName.includes('sales') ? 'SALES'
+        : funcName.includes('marketing') ? 'MARKETING'
+        : funcName.includes('analytics') ? 'ANALYTICS'
+        : funcName.includes('exec') ? 'EXEC'
+        : funcName.includes('product') ? 'PRODUCT'
+        : funcName.includes('security') ? 'SECURITY'
+        : funcName.includes('facilities') ? 'FACILITIES'
+        : funcName.includes('procurement') ? 'PROCUREMENT'
+        : funcName.includes('legal') ? 'LEGAL'
+        : funcName.includes('it') ? 'IT'
+        : funcName.includes('hr') ? 'HR'
+        : funcName.includes('fin') ? 'FIN'
+        : funcName.includes('ops') ? 'OPS'
+        : funcName.includes('cs') ? 'CS'
+        : 'RESEARCH')) as Dept;
 
   const action =
-    dept === 'SALES' ? 'create_or_update_lead' :
-    dept === 'OPS'   ? 'schedule_meeting'     :
-                       'draft_quote';
+    args?.ticket?.action ||
+    args?.action ||
+    (dept === 'SALES' ? 'create_or_update_lead'
+      : dept === 'OPS' ? 'schedule_meeting'
+      : dept === 'FIN' ? 'draft_quote'
+      : dept === 'MARKETING' ? 'create_campaign'
+      : dept === 'ANALYTICS' ? 'run_report'
+      : dept === 'EXEC' ? 'daily_digest'
+      : dept === 'PRODUCT' ? 'create_ticket'
+      : dept === 'SECURITY' ? 'incident_intake'
+      : dept === 'FACILITIES' ? 'create_work_order'
+      : dept === 'PROCUREMENT' ? 'create_po'
+      : dept === 'LEGAL' ? 'review_contract'
+      : dept === 'IT' ? 'create_ticket'
+      : dept === 'HR' ? 'new_hire'
+      : dept === 'CS' ? 'create_ticket'
+      : 'build_kb');
 
   const tenant_id =
     args?.ticket?.context?.tenant_id ||
@@ -60,6 +95,7 @@ function synthTicket(funcName: string, args: any): DeptTicket {
   return { ...base, ...(args?.ticket || {}) };
 }
 
+// ==== Handler ================================================================
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
@@ -83,23 +119,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       constraints: { sensitivity: 'NONE' }
     };
     const resp = await fetch(`${origin}/api/corp/ingest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(spinePayload)
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(spinePayload)
     });
     const data = await resp.json();
     const reply = data?.summary ? `Done: ${data.summary.replace(/, /g, ' • ')}` : 'Processed locally.';
     return res.status(200).json({ ok: true, mode: 'local', reply, raw: data });
   }
 
-  // ---------- OPENAI AGENT PATH (with tools) ----------
+  // ---------- OPENAI AGENT PATH ----------
   try {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return res.status(500).json({ ok: false, error: 'Missing OPENAI_API_KEY' });
     const client = new OpenAI({ apiKey });
     const origin = new URL(req.url!, `https://${req.headers.host}`).origin;
 
-    // Tools exposed to the model
+    // Tools the model can call
     const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       {
         type: 'function',
@@ -108,10 +142,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           description: 'Validate minimal shape and produce a tenant_id.',
           parameters: {
             type: 'object',
-            properties: {
-              utterance: { type: 'string' },
-              context: { type: 'object' }
-            },
+            properties: { utterance: { type: 'string' }, context: { type: 'object' } },
             required: ['utterance']
           }
         }
@@ -120,11 +151,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         type: 'function',
         function: {
           name: 'build_tickets',
-          description: 'Create DepartmentTickets for an ordered plan like SALES→OPS→FIN.',
+          description: 'Create DepartmentTickets for an ordered plan (e.g., SALES→OPS→FIN).',
           parameters: {
             type: 'object',
             properties: {
-              plan: { type: 'array', items: { type: 'string', enum: ['SALES','OPS','FIN'] } },
+              plan: { type: 'array', items: { type: 'string' } }, // any of the Dept values
               session_id: { type: 'string' },
               tenant_id: { type: 'string' }
             },
@@ -135,25 +166,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       {
         type: 'function',
         function: {
-          name: 'sales_handle',
-          description: 'Mock SALES handler. Returns status and summary for a DepartmentTicket.',
-          parameters: { type: 'object', properties: { ticket: { type: 'object' } }, required: [] }
-        }
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'ops_handle',
-          description: 'Mock OPS handler. Returns status and summary for a DepartmentTicket.',
-          parameters: { type: 'object', properties: { ticket: { type: 'object' } }, required: [] }
-        }
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'fin_handle',
-          description: 'Mock FIN handler. Returns status and summary for a DepartmentTicket.',
-          parameters: { type: 'object', properties: { ticket: { type: 'object' } }, required: [] }
+          name: 'execute_department',
+          description:
+            'Execute a DepartmentTicket by POSTing to /api/dept/all. Use this for any department (SALES, MARKETING, ANALYTICS, EXEC, PRODUCT, SECURITY, FACILITIES, PROCUREMENT, LEGAL, IT, HR, FIN, OPS, CS, RESEARCH).',
+          parameters: {
+            type: 'object',
+            properties: { ticket: { type: 'object' } },
+            required: ['ticket']
+          }
         }
       },
       {
@@ -163,23 +183,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           description: 'Build a company profile and crawl plan for a given website URL.',
           parameters: {
             type: 'object',
-            properties: {
-              website: { type: 'string' },
-              tenant_id: { type: 'string' },
-              company_name: { type: 'string' }
-            },
+            properties: { website: { type:'string' }, tenant_id: { type:'string' }, company_name: { type:'string' } },
             required: ['website']
           }
         }
       }
     ];
 
-    // Messages
     const msgs: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
       {
         role: 'system',
         content:
-          'You are the Master Spine. For CRM/meeting/quote tasks, plan SALES→OPS→FIN and call tools in order: schema_guard → build_tickets → dept handlers. If a website is provided, call research_build_kb with it and summarize the crawl plan.'
+          'You are the Master Spine. For business operations, plan department steps and call: schema_guard → build_tickets → execute_department (for each ticket) in order. When a website is provided, call research_build_kb and summarize crawl plan. Keep responses concise and action-focused.'
       },
       { role: 'user', content: `Utterance: ${message}\nContext: ${JSON.stringify(context || {})}` }
     ];
@@ -189,6 +204,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const name = call.function?.name;
       let args: any = {};
       try { args = JSON.parse(call.function?.arguments || '{}'); } catch {}
+
       switch (name) {
         case 'schema_guard': {
           const utter = String(args.utterance || '').trim();
@@ -200,57 +216,78 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           const tenant_id = `tenant_${domain.replace(/\./g,'_')}_${Date.now().toString(36)}`;
           return { ok:true, tenant_id };
         }
+
         case 'build_tickets': {
-          const plan: Dept[] = (Array.isArray(args.plan) && args.plan.length ? args.plan : ['SALES','OPS','FIN']) as Dept[];
+          const plan: string[] = Array.isArray(args.plan) && args.plan.length ? args.plan : ['SALES','OPS','FIN'];
           const session_id = args.session_id || ('sess_' + Date.now());
           const tenant_id = args.tenant_id || ('tenant_local_' + Date.now().toString(36));
           const caps = mkCapabilities();
+
           const tickets: Record<string, DeptTicket> = {};
-          plan.forEach((dept: Dept, i: number) => {
-            const action = dept === 'SALES' ? 'create_or_update_lead' : dept === 'OPS' ? 'schedule_meeting' : 'draft_quote';
+          plan.forEach((raw, i) => {
+            // cast/paranoia around casing
+            const dept = String(raw).toUpperCase() as Dept;
+            // default actions by dept (can be overridden later)
+            const action =
+              dept === 'SALES' ? 'create_or_update_lead'
+              : dept === 'OPS' ? 'schedule_meeting'
+              : dept === 'FIN' ? 'draft_quote'
+              : dept === 'MARKETING' ? 'create_campaign'
+              : dept === 'ANALYTICS' ? 'run_report'
+              : dept === 'EXEC' ? 'daily_digest'
+              : dept === 'PRODUCT' ? 'create_ticket'
+              : dept === 'SECURITY' ? 'incident_intake'
+              : dept === 'FACILITIES' ? 'create_work_order'
+              : dept === 'PROCUREMENT' ? 'create_po'
+              : dept === 'LEGAL' ? 'review_contract'
+              : dept === 'IT' ? 'create_ticket'
+              : dept === 'HR' ? 'new_hire'
+              : dept === 'CS' ? 'create_ticket'
+              : 'build_kb';
+
             tickets[dept] = {
               id: `sess_${Date.now()}:${dept}:${action}:${i}`,
-              dept, action,
+              dept: dept as Dept,
+              action,
               inputs: { notes: 'N/A' },
               context: { tenant_id, capabilities: caps },
               idempotency_key: `${session_id}:${dept}:${action}:0`,
-              sla_sec: 120, retries: 2
+              sla_sec: 120,
+              retries: 2
             };
           });
-          return { ok:true, tickets };
+          return { ok:true, tickets, plan };
         }
-        case 'sales_handle':
-        case 'ops_handle':
-        case 'fin_handle': {
-          const t = synthTicket(call.function!.name, args);
-          return {
-            ok: true,
-            dept: t.dept,
-            status: 'ok',
-            summary: `${t.dept} processed: ${t.action}`,
-            ticket: t,
-            diagnostics: { adapter: 'mock' }
-          };
+
+        case 'execute_department': {
+          // tolerate missing/partial ticket from model
+          const t = synthTicket('execute_department', args);
+          const r = await fetch(`${new URL(req.url!, `https://${req.headers.host}`).origin}/api/dept/all`, {
+            method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ ticket: t })
+          });
+          return await r.json();
         }
+
         case 'research_build_kb': {
           const payload = {
             tenant_id: args.tenant_id || `tenant_web_${Date.now().toString(36)}`,
             company_name: args.company_name || '',
             website: args.website
           };
-          const resp = await fetch(`${origin}/api/research/build-kb`, {
+          const resp = await fetch(`${new URL(req.url!, `https://${req.headers.host}`).origin}/api/research/build-kb`, {
             method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
           });
           return await resp.json();
         }
+
         default:
           return { ok:false, error:`Unknown tool: ${name}` };
       }
     }
 
-    // Let the model call tools up to 6 times
+    // Let the model plan + call tools up to 8 steps
     let finalText = '';
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 8; i++) {
       const completion = await client.chat.completions.create({
         model: process.env.AGENT_MODEL || 'gpt-5-mini',
         messages: msgs,
@@ -263,7 +300,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         msgs.push({ role: 'assistant', tool_calls: msg.tool_calls } as any);
         for (const tc of msg.tool_calls) {
           const toolResult = await runToolCall(tc);
-          msgs.push({ role: 'tool', name: tc.function!.name, content: JSON.stringify(toolResult), tool_call_id: tc.id } as any);
+          msgs.push({
+            role: 'tool',
+            name: tc.function!.name,
+            content: JSON.stringify(toolResult),
+            tool_call_id: tc.id
+          } as any);
         }
         continue;
       }
