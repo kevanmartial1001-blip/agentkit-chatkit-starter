@@ -6,7 +6,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
  *
  * Env needed:
  * - OPENAI_API_KEY
- * - CHATKIT_WORKFLOW_ID
+ * - CHATKIT_WORKFLOW_ID          (e.g. "wf_68e5...")
  * - (optional) CHATKIT_WORKFLOW_VERSION  e.g. "2"
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -15,21 +15,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    const workflow_id = process.env.CHATKIT_WORKFLOW_ID;
-    if (!workflow_id) {
+    const workflowId = process.env.CHATKIT_WORKFLOW_ID;
+    if (!workflowId) {
       return res.status(500).json({ error: "CHATKIT_WORKFLOW_ID is not set" });
     }
     const version = process.env.CHATKIT_WORKFLOW_VERSION; // optional
 
-    const body: Record<string, unknown> = { workflow_id };
-    if (version) body.version = version;
+    // NEW: ChatKit expects { workflow: { id, version? } }
+    const body = {
+      workflow: version ? { id: workflowId, version } : { id: workflowId },
+    };
 
     const resp = await fetch("https://api.openai.com/v1/chatkit/sessions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
         "Content-Type": "application/json",
-        // REQUIRED header for ChatKit beta endpoints:
         "OpenAI-Beta": "chatkit_beta=v1",
       },
       body: JSON.stringify(body),
