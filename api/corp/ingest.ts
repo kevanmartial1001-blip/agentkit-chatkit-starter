@@ -10,21 +10,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return bad(res, 'Method Not Allowed', 405);
   }
 
+  const trace: Array<{ at: string; msg: string }> = [];
+  const step = (msg: string) => trace.push({ at: new Date().toISOString(), msg });
+
+  step('received_request');
+
   const body = (req.body ?? {}) as any;
   const { user_id, session_id, utterance } = body;
 
   if (!user_id || !session_id || !utterance) {
-    return bad(res, 'BAD_REQUEST: Missing user_id | session_id | utterance');
+    step('schema_guard:bad_request');
+    return res.status(400).json({ ok: false, error: 'BAD_REQUEST: Missing user_id | session_id | utterance', trace });
   }
 
+  step('schema_guard:ok');
+
+  // tenant
   const domain =
     body?.context?.company?.domain ||
     (body?.context?.company?.name ? String(body.context.company.name).toLowerCase().replace(/\s+/g, '') + '.local' : '') ||
     'local.dev';
-
   const tenant_id = `tenant_${domain.replace(/\./g, '_')}_${Date.now().toString(36)}`;
+  step(`tenant_resolver:${tenant_id}`);
 
-  const plan = ['SALES', 'OPS', 'FIN'];
+  // naive intent → dept plan
+  step('intent_classifier:stub');
+  const plan = ['SALES', 'OPS', 'FIN']; // you can customize later
+
+  step('planner:build_tickets');
   const capabilities = {
     crm: { provider: 'none' },
     support_desk: { provider: 'none' },
@@ -49,6 +62,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     };
   });
 
+  step('policy_gates:ok');
+
+  // mock department handlers
+  step('departments:execute:start');
   const results = tickets.map(t => ({
     dept: t.dept,
     status: 'ok',
@@ -56,7 +73,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ticket: t,
     diagnostics: { adapter: 'mock' }
   }));
+  step('departments:execute:done');
 
+  step('merge:final');
   const summary = results.map(r => `${r.dept}:${r.status}`).join(', ');
-  return res.status(200).json({ ok: true, stage: 'FINAL', summary, results });
+
+  step('respond:200');
+  return res.status(200).json({
+    ok: true,
+    stage: 'FINAL',
+    tenant_id,
+    summary,
+    results,
+    trace
+  });
 }
