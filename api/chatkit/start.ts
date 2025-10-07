@@ -2,7 +2,6 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 /**
  * Issue a short-lived ChatKit client secret for your published workflow.
- * Accepts POST (recommended). GET is also allowed for manual testing.
  *
  * Env:
  * - OPENAI_API_KEY
@@ -21,29 +20,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     const version = process.env.CHATKIT_WORKFLOW_VERSION; // optional
 
-    // Accept optional user fields from query/body; otherwise autogenerate.
+    // Accept optional user from query/body; else autogenerate.
     const parsedBody =
       typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const userFromQuery =
-      typeof req.query.userId === "string" || typeof req.query.userName === "string"
-        ? { id: String(req.query.userId || ""), name: String(req.query.userName || "") }
-        : undefined;
+      typeof req.query.user === "string" ? String(req.query.user) : undefined;
 
-    const user: { id: string; name?: string } = {
-      id:
-        (parsedBody.userId as string) ||
-        (userFromQuery?.id as string) ||
-        `user_${Date.now().toString(36)}`,
-      name:
-        (parsedBody.userName as string) ||
-        (userFromQuery?.name as string) ||
-        undefined,
-    };
+    const user: string =
+      (parsedBody.user as string) ||
+      userFromQuery ||
+      `user_${Date.now().toString(36)}`;
 
-    // ChatKit expects { workflow: { id, version? }, user: { id, name? } }
+    // ChatKit expects { workflow: { id, version? }, user: "<string>" }
     const body = {
       workflow: version ? { id: workflowId, version } : { id: workflowId },
-      user,
+      user
     };
 
     const resp = await fetch("https://api.openai.com/v1/chatkit/sessions", {
@@ -51,9 +42,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
         "Content-Type": "application/json",
-        "OpenAI-Beta": "chatkit_beta=v1",
+        "OpenAI-Beta": "chatkit_beta=v1"
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(body)
     });
 
     if (!resp.ok) {
