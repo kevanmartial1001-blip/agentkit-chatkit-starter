@@ -9,11 +9,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const path = (req.query.path || []) as string[];
   const method = req.method || 'GET';
 
-  // --- Route: GET /api/health (static-style JSON; zero external calls)
+  // GET /api/health
   if (method === 'GET' && path.length === 1 && path[0] === 'health') {
     return json(res, 200, { ok: true, service: 'agentkit-chatkit-starter' });
   }
 
-  // Fallback for unknown routes
   return json(res, 404, { ok: false, error: 'Not Found', route: `/api/${path.join('/')}` });
 }
