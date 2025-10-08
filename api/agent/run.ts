@@ -1,191 +1,188 @@
-// /api/agent/run.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
-type AgentPayload = {
-  message: string;
-  user?: string;
-  context?: {
-    tenant_id?: string;
-    capabilities?: Record<string, unknown>;
-  };
-};
-
-// Small helpers
-function ok(res: VercelResponse, payload: unknown, status = 200) {
-  res.status(status).setHeader('Content-Type', 'application/json');
-  res.end(JSON.stringify(payload));
+function json(res: VercelResponse, code: number, payload: unknown) {
+  res.status(code).setHeader('Content-Type', 'application/json');
+  res.send(JSON.stringify(payload));
 }
-function fail(res: VercelResponse, msg: string, status = 400, extra: any = {}) {
-  res.status(status).setHeader('Content-Type', 'application/json');
-  res.end(JSON.stringify({ ok: false, error: msg, ...extra }));
+function bad(res: VercelResponse, msg: string, code = 400) {
+  return json(res, code, { ok: false, error: msg });
 }
 
-const THIS_ORIGIN = process.env.VERCEL_URL
-  ? `https://${process.env.VERCEL_URL}`
-  : ''; // optional; we’ll build absolute URLs from req.headers if needed
+// --- Utils ------------------------------------------------------------------
 
-function absoluteApi(req: VercelRequest, path: string) {
-  if (THIS_ORIGIN) return `${THIS_ORIGIN}${path}`;
-  // Build from incoming request host if running locally or preview
-  const proto = (req.headers['x-forwarded-proto'] as string) || 'https';
-  const host = (req.headers['x-forwarded-host'] as string) || req.headers.host;
-  return `${proto}://${host}${path}`;
-}
+/**
+ * Extract the first http(s) URL from a free-form sentence and clean it.
+ * - removes trailing punctuation, quotes, closing parens/brackets
+ * - returns undefined if none found
+ */
+function getFirstUrlFromText(s: string | undefined): string | undefined {
+  if (!s) return undefined;
 
-function extractFirstUrl(text: string): string | null {
-  const m = text.match(/\bhttps?:\/\/[^\s)]+/i);
-  return m ? m[0] : null;
-}
+  // 1) find first http(s) URL-like token
+  const m = s.match(/https?:\/\/[^\s<>")'}\]]+/i);
+  if (!m) return undefined;
 
-function wantsResearch(text: string) {
-  const s = text.toLowerCase();
-  return s.includes('research') || /\bhttps?:\/\//i.test(s);
-}
+  let url = m[0];
 
-function wantsLead(text: string) {
-  return /create (a )?new lead|create lead|add lead/i.test(text);
-}
-function wantsMeeting(text: string) {
-  return /schedule .*meeting|book .*meeting|30 minute meeting|30-minute meeting/i.test(text);
-}
-function wantsQuote(text: string) {
-  return /draft (a )?quote|create quote|make a quote/i.test(text);
-}
+  // 2) strip trailing punctuation/quotes that often ride along in prose
+  url = url.replace(/[),.;:'"’”]+$/g, '');
 
-async function postJson(url: string, body: any, timeoutMs = 15000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  // 3) normalize double leading slashes (rare)
+  url = url.replace(/^\/\//, 'https://');
+
+  // 4) final sanity check
   try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
-    });
-    const txt = await res.text();
-    let json: any = null;
-    try { json = txt ? JSON.parse(txt) : null; } catch { /* ignore */ }
-    return { status: res.status, ok: res.ok, json, text: txt };
-  } finally {
-    clearTimeout(t);
+    const u = new URL(url);
+    return `${u.protocol}//${u.hostname}${u.pathname ? u.pathname : ''}`;
+  } catch {
+    return undefined;
   }
 }
+
+async function postJson<T>(url: string, body: any): Promise<T> {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const txt = await r.text();
+  try {
+    return JSON.parse(txt) as T;
+  } catch {
+    // keep raw body so caller sees HTML (e.g., Vercel protection page)
+    return { ok: false, status: r.status, body: txt } as unknown as T;
+  }
+}
+
+// --- Types (minimal) --------------------------------------------------------
+
+type DeptTicket = {
+  id: string;
+  dept: 'SALES' | 'OPS' | 'FIN';
+  action: string;
+  inputs: Record<string, unknown>;
+  context: { tenant_id: string; capabilities?: Record<string, unknown> };
+  idempotency_key: string;
+  sla_sec: number;
+  retries: number;
+};
+
+type DeptReply = {
+  ok: boolean;
+  dept: string;
+  status: 'ok' | 'error';
+  summary: string;
+  ticket: DeptTicket;
+  diagnostics?: unknown;
+};
+
+type ResearchReply = {
+  ok: boolean;
+  tenant_id?: string;
+  company_url?: string;
+  domain?: string;
+  kb_records_count?: number;
+  profile?: unknown;
+  status?: number;
+  body?: string; // when not-JSON (e.g., Vercel protection HTML)
+};
+
+// --- Handler ----------------------------------------------------------------
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
-    return fail(res, 'Method not allowed', 405);
+    return bad(res, 'Method Not Allowed', 405);
   }
 
-  try {
-    const body = (req.body || {}) as AgentPayload;
-    const message = (body.message || '').trim();
-    if (!message) return fail(res, "Missing 'message' in body.", 400);
+  const { message = '', user = 'ps_test_user', context = {} } = (req.body ?? {}) as {
+    message?: string;
+    user?: string;
+    context?: { tenant_id?: string; capabilities?: Record<string, unknown> };
+  };
 
-    const tenant_id =
-      body.context?.tenant_id ||
-      'tenant_manual_test'; // sensible default so you don’t have to type it every time
+  const tenant_id = context?.tenant_id || 'tenant_manual_test';
+  const capabilities = context?.capabilities || {};
 
-    const capabilities = body.context?.capabilities || {};
+  // 1) Research (optional if URL present)
+  const website = getFirstUrlFromText(String(message));
+  let research: ResearchReply | null = null;
+  let did_research = false;
 
-    const plan: Array<{ step: string; endpoint: string; request: any; response?: any }> = [];
-    const results: any = { research: null, sales: null, ops: null, fin: null };
-
-    // 1) Research branch (KB)
-    if (wantsResearch(message)) {
-      const website = extractFirstUrl(message) || 'https://example.com';
-      const kbReq = {
+  if (website) {
+    did_research = true;
+    research = await postJson<ResearchReply>(
+      `${req.headers['x-forwarded-proto'] ?? 'https'}://${req.headers.host}/api/research/build-kb`,
+      {
         website,
         tenant_id,
-        company_name: new URL(website).hostname.replace(/^www\./i, ''),
-      };
-      const kbUrl = absoluteApi(req, '/api/research/build-kb');
-      const kbResp = await postJson(kbUrl, kbReq);
-
-      plan.push({ step: 'research_build_kb', endpoint: kbUrl, request: kbReq, response: kbResp });
-
-      if (!kbResp.ok) {
-        // Continue but record the failure
-        results.research = { ok: false, status: kbResp.status, body: kbResp.json || kbResp.text };
-      } else {
-        results.research = kbResp.json;
+        company_name: undefined, // optional—tool will infer from domain
       }
-    }
-
-    // 2) Execution branch (tickets)
-    const needsLead = wantsLead(message);
-    const needsMeeting = wantsMeeting(message);
-    const needsQuote = wantsQuote(message);
-
-    const deptUrl = absoluteApi(req, '/api/dept/all');
-
-    // SALES: create_or_update_lead
-    if (needsLead) {
-      const ticket = {
-        id: 'sess_test:SALES:create_or_update_lead:0',
-        dept: 'SALES',
-        action: 'create_or_update_lead',
-        inputs: { lead_name: 'Unknown Lead', source: 'agent' },
-        context: { tenant_id, capabilities },
-        idempotency_key: 'sess_test:SALES:create_or_update_lead:0',
-        sla_sec: 120,
-        retries: 2,
-      };
-      const resp = await postJson(deptUrl, { ticket });
-      plan.push({ step: 'execute_department:SALES', endpoint: deptUrl, request: { ticket }, response: resp });
-      results.sales = resp.json || resp.text;
-    }
-
-    // OPS: schedule_meeting (default 30 min)
-    if (needsMeeting) {
-      const ticket = {
-        id: 'sess_test:OPS:schedule_meeting:0',
-        dept: 'OPS',
-        action: 'schedule_meeting',
-        inputs: { length_min: 30, calendar: 'owner' },
-        context: { tenant_id, capabilities },
-        idempotency_key: 'sess_test:OPS:schedule_meeting:0',
-        sla_sec: 120,
-        retries: 2,
-      };
-      const resp = await postJson(deptUrl, { ticket });
-      plan.push({ step: 'execute_department:OPS', endpoint: deptUrl, request: { ticket }, response: resp });
-      results.ops = resp.json || resp.text;
-    }
-
-    // FIN: draft_quote
-    if (needsQuote) {
-      const ticket = {
-        id: 'sess_test:FIN:draft_quote:0',
-        dept: 'FIN',
-        action: 'draft_quote',
-        inputs: { currency: 'USD', terms: 'NET 30' },
-        context: { tenant_id, capabilities },
-        idempotency_key: 'sess_test:FIN:draft_quote:0',
-        sla_sec: 120,
-        retries: 2,
-      };
-      const resp = await postJson(deptUrl, { ticket });
-      plan.push({ step: 'execute_department:FIN', endpoint: deptUrl, request: { ticket }, response: resp });
-      results.fin = resp.json || resp.text;
-    }
-
-    // Final reply
-    return ok(res, {
-      ok: true,
-      user: body.user || 'anonymous',
-      context: { tenant_id },
-      summary: {
-        did_research: Boolean(results.research),
-        did_sales: Boolean(results.sales),
-        did_ops: Boolean(results.ops),
-        did_fin: Boolean(results.fin),
-      },
-      results,
-      debug_plan: plan, // helpful to view in Vercel logs or browser
-    });
-  } catch (err: any) {
-    console.error('agent/run error:', err?.stack || err);
-    return fail(res, 'Unhandled error in /api/agent/run', 500, { details: String(err?.message || err) });
+    );
   }
+
+  // 2) Build and execute the default SALES → OPS → FIN plan
+  const plan: DeptTicket[] = [
+    {
+      id: `sess:${tenant_id}:SALES:create_or_update_lead:0`,
+      dept: 'SALES',
+      action: 'create_or_update_lead',
+      inputs: { lead_name: 'Unknown Lead', source: 'agent' },
+      context: { tenant_id, capabilities },
+      idempotency_key: `sess:${tenant_id}:SALES:create_or_update_lead:0`,
+      sla_sec: 120,
+      retries: 2,
+    },
+    {
+      id: `sess:${tenant_id}:OPS:schedule_meeting:0`,
+      dept: 'OPS',
+      action: 'schedule_meeting',
+      inputs: { length_min: 30, calendar: 'owner' },
+      context: { tenant_id, capabilities },
+      idempotency_key: `sess:${tenant_id}:OPS:schedule_meeting:0`,
+      sla_sec: 120,
+      retries: 2,
+    },
+    {
+      id: `sess:${tenant_id}:FIN:draft_quote:0`,
+      dept: 'FIN',
+      action: 'draft_quote',
+      inputs: { currency: 'USD', terms: 'NET 30' },
+      context: { tenant_id, capabilities },
+      idempotency_key: `sess:${tenant_id}:FIN:draft_quote:0`,
+      sla_sec: 120,
+      retries: 2,
+    },
+  ];
+
+  const base = `${req.headers['x-forwarded-proto'] ?? 'https'}://${req.headers.host}`;
+  const results: Record<string, any> = {};
+
+  async function exec(ticket: DeptTicket) {
+    const out = await postJson<DeptReply>(`${base}/api/dept/all`, { ticket });
+    results[ticket.dept.toLowerCase()] = out;
+    return out;
+  }
+
+  const sales = await exec(plan[0]);
+  const ops = await exec(plan[1]);
+  const fin = await exec(plan[2]);
+
+  return json(res, 200, {
+    ok: true,
+    user,
+    context: { tenant_id, capabilities },
+    summary: {
+      did_research,
+      did_sales: sales?.ok === true,
+      did_ops: ops?.ok === true,
+      did_fin: fin?.ok === true,
+    },
+    results: {
+      research: research ?? null,
+      sales,
+      ops,
+      fin,
+    },
+  });
 }
