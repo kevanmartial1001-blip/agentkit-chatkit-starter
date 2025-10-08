@@ -1,3 +1,4 @@
+// /api/research/build-kb.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 function json(res: VercelResponse, code: number, payload: unknown) {
@@ -6,21 +7,6 @@ function json(res: VercelResponse, code: number, payload: unknown) {
 }
 function bad(res: VercelResponse, msg: string, code = 400) {
   return json(res, code, { ok: false, error: msg });
-}
-
-/** Allow custom-tool string calls like RESEARCH_BUILD_KB({...}) */
-function extractJsonFromParenCall(input: unknown, prefix: string) {
-  try {
-    if (typeof input !== 'string') return { ok: false as const, error: 'not-string' as const };
-    const re = new RegExp(`^\\s*${prefix}\\((([\\s\\S]+))\\)\\s*$`, 'i');
-    const m = input.match(re);
-    if (!m) return { ok: false as const, error: 'no-match' as const };
-    const inner = m[1];
-    const parsed = JSON.parse(inner);
-    return { ok: true as const, json: parsed };
-  } catch (e: any) {
-    return { ok: false as const, error: e?.message || 'parse-error' };
-  }
 }
 
 function ensureAbsoluteUrl(rawIn: unknown) {
@@ -35,14 +21,26 @@ function ensureAbsoluteUrl(rawIn: unknown) {
 }
 
 // --- tiny helpers (no deps) ---
-async function fetchTextWithLimit(url: string, ms = 4000, maxBytes = 250_000) {
+async function fetchTextWithLimit(
+  url: string,
+  ms = 4000,
+  maxBytes = 250_000,
+  extraHeaders: Record<string, string> = {}
+) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
-    const res = await fetch(url, { redirect: 'follow', signal: ctrl.signal });
+    const res = await fetch(url, {
+      redirect: 'follow',
+      signal: ctrl.signal,
+      headers: {
+        'User-Agent': 'kb-crawler/1.0',
+        ...extraHeaders,
+      },
+    });
     if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
-    const reader = res.body?.getReader?.();
-    if (!reader) return await (res as any).text?.() ?? (await res.arrayBuffer()).toString();
+    const reader = (res as any).body?.getReader?.();
+    if (!reader) return await (res as any).text(); // environments without streams
     const chunks: Uint8Array[] = [];
     let total = 0;
     while (true) {
@@ -110,20 +108,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return bad(res, 'Method Not Allowed', 405);
   }
 
-  let b: any | undefined;
-
-  // A) Custom Tool string call: RESEARCH_BUILD_KB({...})
-  if (typeof req.body === 'string') {
-    const ex = extractJsonFromParenCall(req.body, 'RESEARCH_BUILD_KB');
-    if (ex.ok) b = ex.json;
-  }
-
-  // B) Normal JSON body
-  if (!b && typeof req.body === 'object' && req.body) {
-    b = req.body;
-  }
-
-  const rawUrl = b?.website || b?.company_url || b?.company?.url || b?.url;
+  const b: any = req.body || {};
+  const rawUrl = b.website || b.company_url || b?.company?.url || b.url;
 
   let absolute: string, host: string;
   try {
@@ -132,8 +118,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return bad(res, e?.message || 'Invalid company URL', 400);
   }
 
-  const tenant_id = b?.tenant_id || `tenant_${host.replace(/\./g, '_')}_${Date.now().toString(36)}`;
-  const company_name = b?.company_name || b?.company?.name || host;
+  const tenant_id = b.tenant_id || `tenant_${host.replace(/\./g, '_')}_${Date.now().toString(36)}`;
+  const company_name = b.company_name || b?.company?.name || host;
+
+  // ----- BYPASS SUPPORT (Vercel Protection) ----------------------------------
+  // Accept either a full cookie string, or just a token.
+  const bypass_token: string = typeof b.bypass_token === 'string' ? b.bypass_token.trim() : '';
+  const bypass_cookie_in: string = typeof b.bypass_cookie === 'string' ? b.bypass_cookie.trim() : '';
+
+  // If only token provided, build a standard cookie string:
+  // (the "-s" signed cookie variant is often present; we include s=1 to be safe)
+  const builtCookie = bypass_token
+    ? `vercel-protection-bypass=${bypass_token}; vercel-protection-bypass-s=1`
+    : '';
+
+  const bypass_cookie = bypass_cookie_in || builtCookie;
+  const commonHeaders: Record<string, string> = bypass_cookie
+    ? { Cookie: bypass_cookie }
+    : {};
 
   // --- SAFE FETCH PLAN (one remote read)
   let discovered: string[] = [];
@@ -141,7 +143,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // 1) Try sitemap.xml (fast, small)
   try {
-    const xml = await fetchTextWithLimit(`${absolute}/sitemap.xml`, 4000, 250_000);
+    const xml = await fetchTextWithLimit(`${absolute}/sitemap.xml`, 4000, 250_000, commonHeaders);
     const locs = parseXmlLocs(xml).filter(u => u.startsWith(absolute));
     if (locs.length) { discovered = locs; source = 'sitemap'; }
   } catch { /* ignore */ }
@@ -149,7 +151,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // 2) Fallback: fetch homepage and extract internal links
   if (discovered.length === 0) {
     try {
-      const html = await fetchTextWithLimit(`${absolute}/`, 4000, 250_000);
+      const html = await fetchTextWithLimit(`${absolute}/`, 4000, 250_000, commonHeaders);
       const links = extractLinksFromHtml(html, absolute);
       if (links.length) { discovered = links; source = 'homepage'; }
     } catch { /* ignore */ }
@@ -197,6 +199,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     domain: host,
     kb_records_count: 0,
     profile,
-    flags: { demo: true, source }
+    flags: {
+      demo: true,
+      source,
+      used_bypass_cookie: Boolean(bypass_cookie),
+      used_bypass_token: Boolean(bypass_token),
+    }
   });
 }
